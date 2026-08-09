@@ -6,7 +6,9 @@
 
 Команды:
   token                         получить и показать статус токена
-  services                      список услуг DNS-хостинга
+  domains                       домены договора: NS, DNSSEC, флаги
+  services                      все услуги договора: сроки и автопродление
+  dns-services                  список услуг DNS-хостинга (раздел dns-master)
   zones [SERVICE]               зоны (по всем услугам или по одной)
   zone SERVICE ZONE             содержимое зоны в формате BIND
   records SERVICE ZONE          записи зоны списком (id, тип, имя, значение)
@@ -32,6 +34,16 @@ TOKEN_URL = f"{API}/oauth/token"
 NS = {"n": "http://www.nic.ru/ns/rest/1.0"}
 TOKEN_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".nic_token.json")
 
+# Права токена. dns-master — на чтение и запись, остальные разделы — только чтение.
+# Пути указываются регулярками, поэтому раздел перечисляется дважды: сам путь
+# (/domains) и всё, что под ним (/domains/...).
+DEFAULT_SCOPE = " ".join([
+    "GET:/dns-master/.+", "PUT:/dns-master/.+", "POST:/dns-master/.+", "DELETE:/dns-master/.+",
+    "GET:/domains", "GET:/domains/.+",
+    "GET:/services", "GET:/services/.+",
+])
+SCOPE = os.environ.get("NIC_SCOPE", DEFAULT_SCOPE)
+
 
 class ApiError(Exception):
     pass
@@ -45,10 +57,12 @@ def _env(name):
 
 
 def get_token(force=False):
+    # Кэш хранит scope: если права расширили, старый токен уже не подходит
+    # и его надо перевыпустить, иначе запросы к новым разделам дадут 403.
     if not force and os.path.exists(TOKEN_CACHE):
         with open(TOKEN_CACHE) as fh:
             cached = json.load(fh)
-        if cached.get("access_token"):
+        if cached.get("access_token") and cached.get("scope") == SCOPE:
             return cached["access_token"]
 
     data = urllib.parse.urlencode({
@@ -57,7 +71,7 @@ def get_token(force=False):
         "password": _env("NIC_PASSWORD"),
         "client_id": _env("NIC_CLIENT_ID"),
         "client_secret": _env("NIC_CLIENT_SECRET"),
-        "scope": "GET:/dns-master/.+ PUT:/dns-master/.+ POST:/dns-master/.+ DELETE:/dns-master/.+",
+        "scope": SCOPE,
     }).encode()
 
     req = urllib.request.Request(TOKEN_URL, data=data, method="POST")
@@ -68,6 +82,7 @@ def get_token(force=False):
     except urllib.error.HTTPError as exc:
         raise ApiError(f"не удалось получить токен: HTTP {exc.code} {exc.read().decode(errors='replace')}")
 
+    payload["scope"] = SCOPE
     with open(TOKEN_CACHE, "w") as fh:
         json.dump(payload, fh)
     os.chmod(TOKEN_CACHE, 0o600)
@@ -103,7 +118,36 @@ def cmd_token(_args):
     print("токен получен, кэш:", TOKEN_CACHE)
 
 
-def cmd_services(_args):
+def cmd_domains(_args):
+    # Разделы /domains и /services отвечают JSON, в отличие от dns-master.
+    data = json.loads(call("GET", "/domains"))["data"]
+    for dom in data.get("domain", []):
+        ns = ", ".join(n["name"] for n in dom.get("nameservers", [])) or "не делегирован"
+        flags = ", ".join(k for k, v in (dom.get("flags") or {}).items() if v) or "-"
+        print("{:<24} DNSSEC: {:<4} NS: {}".format(
+            dom.get("idn_domain") or dom.get("domain", "?"),
+            "да" if dom.get("dnssec") else "нет",
+            ns,
+        ))
+        print("{:<24} флаги: {}".format("", flags))
+
+
+def cmd_all_services(_args):
+    data = json.loads(call("GET", "/services"))["data"]
+    svcs = sorted(data.get("service", []), key=lambda s: s.get("expiry_date") or "9999")
+    row = "{:<18} {:<24} {:<9} {:<12} {}"
+    print(row.format("НАЗВАНИЕ", "ТИП", "СТАТУС", "ИСТЕКАЕТ", "АВТОПРОДЛЕНИЕ"))
+    for svc in svcs:
+        print(row.format(
+            svc.get("name", "?"),
+            (svc.get("current_period") or {}).get("service_type", "-"),
+            svc.get("status", "-"),
+            svc.get("expiry_date") or "-",
+            "да" if svc.get("autorenew") else "НЕТ",
+        ))
+
+
+def cmd_dns_services(_args):
     root = parse(call("GET", "/dns-master/services"))
     for svc in root.iterfind(".//n:service", NS):
         print("{:<20} домены: {:<4} зоны: {:<4} {}".format(
@@ -204,7 +248,9 @@ def cmd_raw(args):
 
 COMMANDS = {
     "token": cmd_token,
-    "services": cmd_services,
+    "domains": cmd_domains,
+    "services": cmd_all_services,
+    "dns-services": cmd_dns_services,
     "zones": cmd_zones,
     "zone": cmd_zone,
     "records": cmd_records,
