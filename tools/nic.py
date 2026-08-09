@@ -8,6 +8,8 @@
   token                         получить и показать статус токена
   domains                       домены договора: NS, DNSSEC, флаги
   services                      все услуги договора: сроки и автопродление
+  dnscheck [DOMAIN ...]         проверить DNS доменов: MX, SPF, DMARC, CAA
+  expiring [DAYS]               услуги на исходе (по умолчанию 90 дней)
   dns-services                  список услуг DNS-хостинга (раздел dns-master)
   zones [SERVICE]               зоны (по всем услугам или по одной)
   zone SERVICE ZONE             содержимое зоны в формате BIND
@@ -24,6 +26,7 @@
 import os
 import sys
 import json
+import datetime
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -147,6 +150,92 @@ def cmd_all_services(_args):
         ))
 
 
+def _resolve(name, rtype):
+    """Запрос к публичному резолверу через DNS-over-HTTPS.
+
+    Зоны этого договора живут не в dns-master, а на облачной платформе, которую
+    API не отдаёт. Фактическое состояние DNS видно только снаружи.
+    """
+    url = "https://dns.google/resolve?" + urllib.parse.urlencode({"name": name, "type": rtype})
+    try:
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            payload = json.load(resp)
+    except Exception as exc:
+        raise ApiError(f"резолвер недоступен ({exc}); нужен доступ к dns.google")
+    if payload.get("Status") == 3:
+        return []
+    return [a["data"] for a in payload.get("Answer", [])]
+
+
+def _domain_names():
+    data = json.loads(call("GET", "/domains"))["data"]
+    return [d.get("idn_domain") or d["domain"].lower() for d in data.get("domain", [])]
+
+
+def cmd_dnscheck(args):
+    for dom in args or _domain_names():
+        print("=" * 64)
+        print(dom)
+        print("=" * 64)
+
+        a = _resolve(dom, "A")
+        mx = _resolve(dom, "MX")
+        txt = _resolve(dom, "TXT")
+        dmarc = _resolve(f"_dmarc.{dom}", "TXT")
+        caa = _resolve(dom, "CAA")
+        spf = [t for t in txt if "v=spf1" in t]
+
+        print("  A      ", ", ".join(a) or "—")
+        print("  MX     ", ", ".join(mx) or "—")
+        print("  SPF    ", ", ".join(spf) or "—")
+        print("  DMARC  ", ", ".join(dmarc) or "—")
+        print("  CAA    ", ", ".join(caa) or "—")
+
+        problems = []
+        if not a and not mx:
+            problems.append("зона пустая: нет ни сайта, ни почты")
+        if mx and not spf:
+            problems.append("есть MX, но нет SPF — письма будут падать в спам")
+        if mx and not dmarc:
+            problems.append("есть почта, но нет DMARC — домен можно подделывать")
+        if not mx and any("mail" in t.lower() for t in txt):
+            problems.append("следы почтовой настройки без MX")
+        if not caa:
+            problems.append("нет CAA — сертификат может выпустить любой УЦ")
+
+        print("  " + "-" * 60)
+        if problems:
+            for p in problems:
+                print("  ! " + p)
+        else:
+            print("  замечаний нет")
+        print()
+
+
+def cmd_expiring(args):
+    limit = int(args[0]) if args else 90
+    data = json.loads(call("GET", "/services"))["data"]
+    today = datetime.date.today()
+    rows = []
+    for svc in data.get("service", []):
+        raw = svc.get("expiry_date")
+        if not raw:
+            continue
+        left = (datetime.date.fromisoformat(raw) - today).days
+        if left <= limit:
+            rows.append((left, svc))
+    if not rows:
+        print(f"в ближайшие {limit} дней ничего не истекает")
+        return
+    for left, svc in sorted(rows):
+        print("{:<18} истекает {} (через {} дн.) автопродление: {}".format(
+            svc.get("name", "?"),
+            svc.get("expiry_date"),
+            left,
+            "да" if svc.get("autorenew") else "НЕТ",
+        ))
+
+
 def cmd_dns_services(_args):
     root = parse(call("GET", "/dns-master/services"))
     for svc in root.iterfind(".//n:service", NS):
@@ -250,6 +339,8 @@ COMMANDS = {
     "token": cmd_token,
     "domains": cmd_domains,
     "services": cmd_all_services,
+    "dnscheck": cmd_dnscheck,
+    "expiring": cmd_expiring,
     "dns-services": cmd_dns_services,
     "zones": cmd_zones,
     "zone": cmd_zone,
