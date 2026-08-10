@@ -150,21 +150,54 @@ def cmd_all_services(_args):
         ))
 
 
+# Резолверы по-разному отдают TXT: Cloudflare оборачивает значение в кавычки и
+# экранирует те, что внутри; Google отдаёт содержимое как есть. Разница важна:
+# кавычки, попавшие в саму запись, ломают SPF и DMARC, и их нельзя перепутать
+# с оформлением ответа.
+RESOLVERS = (
+    ("Google", "https://dns.google/resolve", False),
+    ("Cloudflare", "https://cloudflare-dns.com/dns-query", True),
+)
+
+
+def _unwrap(value):
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        return value[1:-1].replace('\\"', '"')
+    return value
+
+
+def _ask(endpoint, name, rtype, wrapped):
+    url = endpoint + "?" + urllib.parse.urlencode({"name": name, "type": rtype})
+    req = urllib.request.Request(url, headers={"Accept": "application/dns-json"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        payload = json.load(resp)
+    if payload.get("Status") == 3:
+        return []
+    values = [a["data"] for a in payload.get("Answer", [])]
+    return [_unwrap(v) for v in values] if wrapped else values
+
+
 def _resolve(name, rtype):
-    """Запрос к публичному резолверу через DNS-over-HTTPS.
+    """Опрос публичных резолверов через DNS-over-HTTPS.
 
     Зоны этого договора живут не в dns-master, а на облачной платформе, которую
     API не отдаёт. Фактическое состояние DNS видно только снаружи.
+
+    Спрашиваем двоих: у одного может лежать устаревший ответ в кэше, и свежая
+    правка выглядела бы как ошибка. Возвращаем значения и признак расхождения.
     """
-    url = "https://dns.google/resolve?" + urllib.parse.urlencode({"name": name, "type": rtype})
-    try:
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            payload = json.load(resp)
-    except Exception as exc:
-        raise ApiError(f"резолвер недоступен ({exc}); нужен доступ к dns.google")
-    if payload.get("Status") == 3:
-        return []
-    return [a["data"] for a in payload.get("Answer", [])]
+    answers, failures = {}, []
+    for label, endpoint, wrapped in RESOLVERS:
+        try:
+            answers[label] = _ask(endpoint, name, rtype, wrapped)
+        except Exception as exc:
+            failures.append(f"{label}: {exc}")
+    if not answers:
+        raise ApiError("резолверы недоступны: " + "; ".join(failures))
+    sets = [frozenset(v) for v in answers.values()]
+    agreed = len(set(sets)) == 1
+    union = sorted({v for values in answers.values() for v in values})
+    return union, agreed, answers
 
 
 def _domain_names():
@@ -178,29 +211,44 @@ def cmd_dnscheck(args):
         print(dom)
         print("=" * 64)
 
-        a = _resolve(dom, "A")
-        mx = _resolve(dom, "MX")
-        txt = _resolve(dom, "TXT")
-        dmarc = _resolve(f"_dmarc.{dom}", "TXT")
-        caa = _resolve(dom, "CAA")
+        a, _, _ = _resolve(dom, "A")
+        mx, _, _ = _resolve(dom, "MX")
+        txt, txt_agreed, txt_by = _resolve(dom, "TXT")
+        dmarc, dmarc_agreed, dmarc_by = _resolve(f"_dmarc.{dom}", "TXT")
+        caa, _, _ = _resolve(dom, "CAA")
         spf = [t for t in txt if "v=spf1" in t]
 
         print("  A      ", ", ".join(a) or "—")
         print("  MX     ", ", ".join(mx) or "—")
-        print("  SPF    ", ", ".join(spf) or "—")
-        print("  DMARC  ", ", ".join(dmarc) or "—")
+        print("  SPF    ", ", ".join(repr(s) for s in spf) or "—")
+        print("  DMARC  ", ", ".join(repr(d) for d in dmarc) or "—")
         print("  CAA    ", ", ".join(caa) or "—")
 
         problems = []
 
         # Лишний пробел в начале TXT ломает запись молча: и SPF, и DMARC
         # опознаются по префиксу версии, а с пробелом префикс не совпадает.
-        for label, values, prefix in (("SPF", spf, "v=spf1"), ("DMARC", dmarc, "v=DMARC1")):
+        # Проверяем только то, в чём резолверы сошлись: расхождение означает
+        # свежую правку, ещё не вытеснившую старое значение из чужого кэша.
+        checks = (
+            ("SPF", spf, "v=spf1", txt_agreed, txt_by),
+            ("DMARC", dmarc, "v=DMARC1", dmarc_agreed, dmarc_by),
+        )
+        for label, values, prefix, agreed, by_resolver in checks:
+            if not agreed:
+                detail = "; ".join(f"{r}: {v}" for r, v in by_resolver.items())
+                problems.append(
+                    f"{label}: резолверы расходятся, идёт распространение правки — {detail}"
+                )
+                continue
             for value in values:
-                bare = value.strip('"')
-                if bare != bare.strip():
+                if value != value.strip():
                     problems.append(f"{label}: лишний пробел по краям записи — она не опознаётся")
-                elif not bare.startswith(prefix):
+                elif value.startswith('"') or value.endswith('"'):
+                    problems.append(
+                        f"{label}: кавычки попали внутрь значения — запись не опознаётся"
+                    )
+                elif not value.startswith(prefix):
                     problems.append(f"{label}: запись не начинается с {prefix} — игнорируется")
 
         if not a and not mx:
