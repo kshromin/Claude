@@ -192,6 +192,17 @@ def cmd_dnscheck(args):
         print("  CAA    ", ", ".join(caa) or "—")
 
         problems = []
+
+        # Лишний пробел в начале TXT ломает запись молча: и SPF, и DMARC
+        # опознаются по префиксу версии, а с пробелом префикс не совпадает.
+        for label, values, prefix in (("SPF", spf, "v=spf1"), ("DMARC", dmarc, "v=DMARC1")):
+            for value in values:
+                bare = value.strip('"')
+                if bare != bare.strip():
+                    problems.append(f"{label}: лишний пробел по краям записи — она не опознаётся")
+                elif not bare.startswith(prefix):
+                    problems.append(f"{label}: запись не начинается с {prefix} — игнорируется")
+
         if not a and not mx:
             problems.append("зона пустая: нет ни сайта, ни почты")
         if mx and not spf:
